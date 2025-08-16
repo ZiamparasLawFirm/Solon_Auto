@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.5
+ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.6
 Single για μονή αναζήτηση • Batch με παράλληλους browsers (BATCH_WORKERS)
-ΝΕΟ: Αυτόματο κλείσιμο του popup «Δεν βρέθηκαν δεδομένα…» (πατάει OK)
-και αυτόματο accept σε browser dialogs.
+Από v1.0.5: αυτόματο κλείσιμο popup «Δεν βρέθηκαν δεδομένα…»
+ΝΕΟ (v1.0.6): Στο batch UI εμφανίζεται αύξων αριθμός εμφάνισης πριν από κάθε όνομα.
 
 Απαιτήσεις:
     pip install flask playwright pandas openpyxl python-dotenv
@@ -106,7 +106,6 @@ def _accept_cookies_if_present(page):
             pass
 
 def _attach_dialog_autoaccept(page):
-    # αυτόματο accept για browser-level dialogs (alert/confirm/prompt)
     try:
         page.on("dialog", lambda d: (d.accept() if hasattr(d, "accept") else None))
     except Exception:
@@ -316,13 +315,8 @@ def _click_search(page):
     btn.click(timeout=2000, force=True)
     return True
 
-# ---- ΝΕΟ: Κλείσιμο του ADF popup «Δεν βρέθηκαν δεδομένα…» ---- #
+# ---- Κλείσιμο του ADF popup «Δεν βρέθηκαν δεδομένα…» ---- #
 def _dismiss_known_overlay(page):
-    """
-    Προσπαθεί να εντοπίσει in-page modal/overlay με μηνύματα τύπου:
-    «Δεν βρέθηκαν δεδομένα…» / «Δεν υπάρχουν αποτελέσματα»
-    και να πατήσει OK (ή ΟΚ). Επιστρέφει True αν πάτησε κάτι.
-    """
     ok_labels = ["OK", "ΟΚ", "Ok", "ok"]
     msg_snippets = [
         "Δεν βρέθηκαν δεδομένα",
@@ -331,39 +325,22 @@ def _dismiss_known_overlay(page):
     ]
     clicked = False
     try:
-        # 1) Απλά βρες κουμπί OK με role
         for name in ok_labels:
             btn = page.get_by_role("button", name=name)
             if btn.count() and btn.first.is_visible():
-                btn.first.click()
-                page.wait_for_timeout(100)
-                clicked = True
-                break
-        if clicked:
-            return True
-
-        # 2) Εντόπισε κείμενο και πάτα OK με XPath γύρω του
+                btn.first.click(); page.wait_for_timeout(100); return True
         for snippet in msg_snippets:
             loc = page.locator(f"text={snippet}")
             if loc.count() and loc.first.is_visible():
-                # ψάξε OK κοντά/πάνω στο modal
                 btn = page.locator("//button[normalize-space()='OK' or normalize-space()='ΟΚ']")
                 if btn.count() and btn.first.is_visible():
-                    btn.first.click()
-                    page.wait_for_timeout(100)
-                    return True
-
-        # 3) Fallback: Enter/Escape
+                    btn.first.click(); page.wait_for_timeout(100); return True
         try:
-            page.keyboard.press("Enter")
-            page.wait_for_timeout(80)
-            return True
+            page.keyboard.press("Enter"); page.wait_for_timeout(80); return True
         except Exception:
             pass
         try:
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(80)
-            return True
+            page.keyboard.press("Escape"); page.wait_for_timeout(80); return True
         except Exception:
             pass
     except Exception:
@@ -465,15 +442,11 @@ def _scrape_one(page, court_label: str, gak_num: str, gak_year: str):
         prev_sig = _get_db_text(page)
 
         _click_search(page)
-
-        # Αν εμφανίστηκε popup «Δεν βρέθηκαν δεδομένα…», κλείστο
         _dismiss_known_overlay(page)
 
         _wait_for_table_ready(page, timeout_ms=RESULT_TIMEOUT)
         _wait_for_table_change(page, prev_sig, timeout_ms=RESULT_TIMEOUT)
         _wait_spinner_cycle_if_any(page)
-
-        # ξανακλείστο αν τυχόν εμφανιστεί αργότερα
         _dismiss_known_overlay(page)
 
         result = _wait_for_target_row_and_read(page, gak_num, gak_year, timeout_ms=RESULT_TIMEOUT)
@@ -507,14 +480,11 @@ def _search_on_prepared_page(page, court_value: str, gak_num: str, gak_year: str
         prev_sig = _get_db_text(page)
 
         _click_search(page)
-
-        # Κλείσε τυχόν popup
         _dismiss_known_overlay(page)
 
         _wait_for_table_ready(page, timeout_ms=RESULT_TIMEOUT)
         _wait_for_table_change(page, prev_sig, timeout_ms=RESULT_TIMEOUT)
         _wait_spinner_cycle_if_any(page)
-
         _dismiss_known_overlay(page)
 
         result = _wait_for_target_row_and_read(page, gak_num, gak_year, timeout_ms=RESULT_TIMEOUT)
@@ -629,7 +599,7 @@ PAGE_HTML = """
 <html lang="el">
 <head>
 <meta charset="utf-8">
-<title>ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.5</title>
+<title>ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.6</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f6f7fb;margin:0}
@@ -655,7 +625,7 @@ PAGE_HTML = """
 </head>
 <body>
 <div class="wrap">
-  <h1>ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.5</h1>
+  <h1>ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.6</h1>
 
   <h3>Μονή Αναζήτηση</h3>
   <form id="single">
@@ -732,6 +702,7 @@ const streamBox = document.getElementById('stream');
 runBtn.addEventListener('click', async () => {
   runBtn.disabled = true; runBtn.textContent = 'Εκτέλεση…';
   streamBox.style.display = 'block'; streamBox.innerHTML = '';
+  let counter = 0; // <-- ΝΕΟ: αύξων αριθμός εμφάνισης
   const es = new EventSource('/api/batch');
   es.onmessage = (ev) => {
     try {
@@ -748,6 +719,8 @@ runBtn.addEventListener('click', async () => {
         return;
       }
 
+      counter += 1; // αυξάνει με την εμφάνιση
+
       const div = document.createElement('div');
       div.className = 'item';
       const Pelatis   = row['Πελάτης'] || '—';
@@ -757,7 +730,7 @@ runBtn.addEventListener('click', async () => {
       const res = row.ok ? (row.result || '<span class="muted">— κενό —</span>')
                          : ('<span class="muted">Σφάλμα: '+(row.error||'')+'</span>');
       const mail = row.email_status ? (' <span class="muted">('+row.email_status+')</span>') : '';
-      div.innerHTML = '<b>'+Pelatis+'</b> — '+Dikastirio+' — ΓΑΚ '+GakNum+'/'+GakYear+
+      div.innerHTML = '<b>'+counter+'. '+Pelatis+'</b> — '+Dikastirio+' — ΓΑΚ '+GakNum+'/'+GakYear+
                       '<br><b>Αριθμός Aπόφασης/\\'Ετος - Είδος Διατακτικού:</b> '+res+mail;
       streamBox.appendChild(div);
       streamBox.scrollTop = streamBox.scrollHeight;
