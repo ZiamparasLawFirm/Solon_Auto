@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.0
-Single-browser app: single + batch από Excel + email + .env options
-(Χωρίς προεπισκόπηση Excel)
+ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.4
+Single-browser για μονή αναζήτηση • Batch με παράλληλους browsers (BATCH_WORKERS)
+Fix: Ανθεκτικό click στο «Αναζήτηση» (overlay-safe) για αποφυγή Timeout: subtree intercepts pointer events.
 
 Απαιτήσεις:
     pip install flask playwright pandas openpyxl python-dotenv
@@ -12,18 +12,24 @@ Single-browser app: single + batch από Excel + email + .env options
     SENDER_EMAIL=your@gmail.com
     RECEIVER_EMAIL=your@gmail.com
     GOOGLE_APP_PASSWORD=app_password
+
     # Απόδοση:
     HEADLESS=1
     BLOCK_MEDIA=1
     FAST_MODE=1
     RESULT_TIMEOUT_MS=60000
     EARLY_NO_DATA_MS=4000
+
+    # Παράλληλη εκτέλεση batch:
+    BATCH_WORKERS=4
+
     # Excel (προαιρετικά):
     EXCEL_SHEET=Sheet1
     COL_CLIENT=Πελάτης
     COL_COURT=Δικαστήριο
     COL_GAK_NUM=Γ.Α.Κ. Αριθμός
     COL_GAK_YEAR=Γ.Α.Κ. Έτος
+
     # Debug:
     DEBUG_ARTIFACTS=0
 """
@@ -34,6 +40,8 @@ from email.message import EmailMessage
 from dotenv import load_dotenv, find_dotenv
 import pandas as pd
 import unicodedata, re, os, json, smtplib, time
+from threading import Thread
+from queue import Queue
 
 load_dotenv(find_dotenv(), override=True)
 
@@ -53,12 +61,13 @@ SEL_GRID_SPIN   = "#pc1\\:ldoTable\\:\\:sm"   # «Ανάκτηση δεδομέ�
 SEL_GRID_TABLE  = "#pc1\\:ldoTable"
 
 # Χρόνοι από .env
-DEFAULT_TIMEOUT = 30_000
-RESULT_TIMEOUT  = int(os.getenv("RESULT_TIMEOUT_MS", "60000"))
-EARLY_NO_DATA_MS = int(os.getenv("EARLY_NO_DATA_MS", "4000"))
+DEFAULT_TIMEOUT   = 30_000
+RESULT_TIMEOUT    = int(os.getenv("RESULT_TIMEOUT_MS", "60000"))
+EARLY_NO_DATA_MS  = int(os.getenv("EARLY_NO_DATA_MS", "4000"))
 
-EXCEL_FILE  = "SOLON_INPUT.xlsx"
-EXCEL_SHEET = os.getenv("EXCEL_SHEET")
+EXCEL_FILE   = "SOLON_INPUT.xlsx"
+EXCEL_SHEET  = os.getenv("EXCEL_SHEET")
+BATCH_WORKERS= max(1, int(os.getenv("BATCH_WORKERS", "4")))
 
 RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL", "dimitris.ziamparas@gmail.com")
 SENDER_EMAIL   = os.getenv("SENDER_EMAIL",   RECEIVER_EMAIL)
@@ -70,9 +79,9 @@ APP_PASSWORD   = (
     or os.getenv("APP_PASSWORD")
 )
 
-HEADLESS      = os.getenv("HEADLESS", "1").lower() not in ("0","false","no")
-BLOCK_MEDIA   = os.getenv("BLOCK_MEDIA", "0").lower() in ("1","true","yes")
-FAST_MODE     = os.getenv("FAST_MODE", "0").lower() in ("1","true","yes")
+HEADLESS        = os.getenv("HEADLESS", "1").lower() not in ("0","false","no")
+BLOCK_MEDIA     = os.getenv("BLOCK_MEDIA", "0").lower() in ("1","true","yes")
+FAST_MODE       = os.getenv("FAST_MODE", "0").lower() in ("1","true","yes")
 DEBUG_ARTIFACTS = os.getenv("DEBUG_ARTIFACTS", "0").lower() in ("1","true","yes")
 
 ENV_COL_CLIENT = os.getenv("COL_CLIENT")
@@ -217,7 +226,6 @@ def _wait_clickable(page, selector: str, timeout_ms=5_000):
     )
 
 def _set_input_value(page, selector: str, value: str):
-    # αξιόπιστη εισαγωγή τιμής χωρίς να κολλάμε σε overlays (ADF)
     try:
         _wait_clickable(page, selector, timeout_ms=5_000)
     except Exception:
@@ -275,6 +283,45 @@ def _set_input_value(page, selector: str, value: str):
             {"sel": selector, "val": str(value)}
         )
         page.wait_for_timeout(60)
+
+# ---- ΝΕΟ: ασφαλές click στο «Αναζήτηση» ---- #
+def _click_search(page):
+    btn = page.locator(SEL_SEARCH_BTN).first
+    try:
+        _wait_clickable(page, SEL_SEARCH_BTN, timeout_ms=5_000)
+    except Exception:
+        pass
+    # 1) Κανονικό click με λίγα retries
+    for _ in range(3):
+        try:
+            btn.click(timeout=2000)
+            return True
+        except Exception:
+            # πιθανό overlay/busy
+            _wait_spinner_cycle_if_any(page)
+            page.wait_for_timeout(120)
+
+    # 2) JS click
+    try:
+        page.evaluate("(sel)=>{const el=document.querySelector(sel); if(el){el.focus(); el.click();}}", SEL_SEARCH_BTN)
+        return True
+    except Exception:
+        pass
+
+    # 3) Enter από το πεδίο Έτος (πολλά ADF έχουν default action)
+    try:
+        page.locator(SEL_GAK_YEAR).focus()
+        page.keyboard.press("Enter")
+        return True
+    except Exception:
+        pass
+
+    # 4) Έσχατο: force click
+    try:
+        btn.click(timeout=2000, force=True)
+        return True
+    except Exception as e:
+        raise e
 
 # ---------------- Court cache ---------------- #
 def _build_court_map(page):
@@ -339,7 +386,6 @@ def _wait_for_target_row_and_read(page, gak_num: str, gak_year: str, timeout_ms=
             val = (res.get("value") or "").strip()
             if _is_meaningful_result(val):
                 return val
-
         if res and res.get("noData"):
             if FAST_MODE:
                 if first_no_data_at is None:
@@ -348,10 +394,8 @@ def _wait_for_target_row_and_read(page, gak_num: str, gak_year: str, timeout_ms=
                     return ""
         else:
             first_no_data_at = None
-
         _wait_spinner_cycle_if_any(page)
         page.wait_for_timeout(200 if FAST_MODE else 300)
-
     return ""
 
 # ---------- SCRAPE (single-run) ---------- #
@@ -372,10 +416,8 @@ def _scrape_one(page, court_label: str, gak_num: str, gak_year: str):
 
         prev_sig = _get_db_text(page)
 
-        btn = page.locator(SEL_SEARCH_BTN)
-        if not (btn.count() and btn.first.is_visible()):
-            return {"ok": False, "error": "Δεν βρέθηκε το κουμπί «Αναζήτηση»."}
-        btn.first.click()
+        # >>> ασφαλές click στο «Αναζήτηση»
+        _click_search(page)
 
         _wait_for_table_ready(page, timeout_ms=RESULT_TIMEOUT)
         _wait_for_table_change(page, prev_sig, timeout_ms=RESULT_TIMEOUT)
@@ -387,7 +429,7 @@ def _scrape_one(page, court_label: str, gak_num: str, gak_year: str):
         if DEBUG_ARTIFACTS:
             _dump_dom(page, base_art)
 
-# ---------- SCRAPE (batch, single navigation) ---------- #
+# ---------- SCRAPE (batch helpers) ---------- #
 def _prepare_page_for_batch(context):
     page = context.new_page()
     page.set_default_timeout(DEFAULT_TIMEOUT)
@@ -410,10 +452,8 @@ def _search_on_prepared_page(page, court_value: str, gak_num: str, gak_year: str
 
         prev_sig = _get_db_text(page)
 
-        btn = page.locator(SEL_SEARCH_BTN)
-        if not (btn.count() and btn.first.is_visible()):
-            return {"ok": False, "error": "Δεν βρέθηκε το κουμπί «Αναζήτηση»."}
-        btn.first.click()
+        # >>> ασφαλές click στο «Αναζήτηση»
+        _click_search(page)
 
         _wait_for_table_ready(page, timeout_ms=RESULT_TIMEOUT)
         _wait_for_table_change(page, prev_sig, timeout_ms=RESULT_TIMEOUT)
@@ -525,13 +565,13 @@ def _load_excel_rows(path=EXCEL_FILE):
             errors.append(f"{sheet}: {e}")
     raise ValueError("Δεν εντοπίστηκαν οι απαιτούμενες στήλες σε κανένα φύλλο του Excel.\n" + "\n".join(errors))
 
-# ---------------- WEB UI (single-column layout) ---------------- #
+# ---------------- WEB UI ---------------- #
 PAGE_HTML = """
 <!doctype html>
 <html lang="el">
 <head>
 <meta charset="utf-8">
-<title>ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.0</title>
+<title>ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.4</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f6f7fb;margin:0}
@@ -557,7 +597,7 @@ PAGE_HTML = """
 </head>
 <body>
 <div class="wrap">
-  <h1>ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.0</h1>
+  <h1>ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.4</h1>
 
   <h3>Μονή Αναζήτηση</h3>
   <form id="single">
@@ -715,73 +755,95 @@ def api_batch():
             yield "data: " + json.dumps({"type": "error", "ok": False, "error": str(e)}, ensure_ascii=False) + "\n\n"
             return
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=HEADLESS)
-            context = browser.new_context(locale="el-GR", viewport={"width":1500,"height":950})
-            if BLOCK_MEDIA:
-                context.route("**/*", _route_blocker)
+        in_q  = Queue()
+        out_q = Queue()
 
-            try:
-                # Προετοιμασία: μία φορά navigation και cache courts
-                page, court_map = _prepare_page_for_batch(context)
+        for i, r in enumerate(rows, start=1):
+            in_q.put((i, r))
+        for _ in range(BATCH_WORKERS):
+            in_q.put(None)  # sentinels
 
-                for i, r in enumerate(rows, start=1):
-                    payload = {**r}
-                    try:
-                        court_value = _get_court_value(court_map, r.get("Δικαστήριο",""))
-                        res = _search_on_prepared_page(
-                            page, court_value,
-                            r.get("Γ.Α.Κ. Αριθμός",""),
-                            r.get("Γ.Α.Κ. Έτος","")
-                        )
-                        payload.update(res)
-
-                        if DEBUG_ARTIFACTS:
-                            _ensure_artifacts_dir()
-                            base = f"row_{i}_{r.get('Γ.Α.Κ. Αριθμός','')}_{r.get('Γ.Α.Κ. Έτος','')}"
-                            with open(f"artifacts/{base}.json","w",encoding="utf-8") as f:
-                                json.dump(res, f, ensure_ascii=False, indent=2)
-                            _dump_dom(page, base)
-
-                    except PWTimeout as e:
-                        payload.update({"ok": False, "error": f"Timeout: {e}"})
-                        if DEBUG_ARTIFACTS:
-                            base = f"row_{i}_{r.get('Γ.Α.Κ. Αριθμός','')}_{r.get('Γ.Α.Κ. Έτος','')}"
-                            _dump_dom(page, base)
-                    except Exception as e:
-                        payload.update({"ok": False, "error": f"Σφάλμα: {e}"})
-                        if DEBUG_ARTIFACTS:
-                            base = f"row_{i}_{r.get('Γ.Α.Κ. Αριθμός','')}_{r.get('Γ.Α.Κ. Έτος','')}"
-                            _dump_dom(page, base)
-
-                    # Email μόνο για ουσιαστικό αποτέλεσμα
-                    email_status = None
-                    try:
-                        if payload.get("ok") and _is_meaningful_result(payload.get("result")):
-                            subject = (
-                                f"ΣΟΛΩΝ • {r.get('Πελάτης','')}"
-                                f" • {r.get('Δικαστήριο','')}"
-                                f" • ΓΑΚ {r.get('Γ.Α.Κ. Αριθμός','')}/{r.get('Γ.Α.Κ. Έτος','')}"
+        def worker(worker_id: int):
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=HEADLESS)
+                context = browser.new_context(locale="el-GR", viewport={"width":1500,"height":950})
+                if BLOCK_MEDIA:
+                    context.route("**/*", _route_blocker)
+                try:
+                    page, court_map = _prepare_page_for_batch(context)
+                    while True:
+                        item = in_q.get()
+                        if item is None:
+                            break
+                        i, r = item
+                        payload = {**r}
+                        try:
+                            court_value = _get_court_value(court_map, r.get("Δικαστήριο",""))
+                            res = _search_on_prepared_page(
+                                page, court_value,
+                                r.get("Γ.Α.Κ. Αριθμός",""),
+                                r.get("Γ.Α.Κ. Έτος","")
                             )
-                            body = (
-                                f"Πελάτης: {r.get('Πελάτης','')}\n"
-                                f"Δικαστήριο: {r.get('Δικαστήριο','')}\n"
-                                f"Γ.Α.Κ.: {r.get('Γ.Α.Κ. Αριθμός','')}\n"
-                                f"Έτος: {r.get('Γ.Α.Κ. Έτος','')}\n\n"
-                                f"Αριθμός Απόφασης/Έτος - Είδος Διατακτικού:\n{payload.get('result','')}\n"
-                            )
-                            ok, msg = _send_email(subject, body)
-                            email_status = "email ok" if ok else f"email failed: {msg}"
-                    except Exception as e:
-                        email_status = f"email skipped: {e}"
+                            payload.update(res)
 
-                    if email_status:
-                        payload["email_status"] = email_status
+                            if DEBUG_ARTIFACTS:
+                                _ensure_artifacts_dir()
+                                base = f"row_{i}_{r.get('Γ.Α.Κ. Αριθμός','')}_{r.get('Γ.Α.Κ. Έτος','')}_w{worker_id}"
+                                with open(f"artifacts/{base}.json","w",encoding="utf-8") as f:
+                                    json.dump(res, f, ensure_ascii=False, indent=2)
+                                _dump_dom(page, base)
 
-                    yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+                            # Email μόνο για ουσιαστικό αποτέλεσμα
+                            email_status = None
+                            try:
+                                if payload.get("ok") and _is_meaningful_result(payload.get("result")):
+                                    subject = (
+                                        f"ΣΟΛΩΝ • {r.get('Πελάτης','')}"
+                                        f" • {r.get('Δικαστήριο','')}"
+                                        f" • ΓΑΚ {r.get('Γ.Α.Κ. Αριθμός','')}/{r.get('Γ.Α.Κ. Έτος','')}"
+                                    )
+                                    body = (
+                                        f"Πελάτης: {r.get('Πελάτης','')}\n"
+                                        f"Δικαστήριο: {r.get('Δικαστήριο','')}\n"
+                                        f"Γ.Α.Κ.: {r.get('Γ.Α.Κ. Αριθμός','')}\n"
+                                        f"Έτος: {r.get('Γ.Α.Κ. Έτος','')}\n\n"
+                                        f"Αριθμός Απόφασης/Έτος - Είδος Διατακτικού:\n{payload.get('result','')}\n"
+                                    )
+                                    ok, msg = _send_email(subject, body)
+                                    email_status = "email ok" if ok else f"email failed: {msg}"
+                            except Exception as e:
+                                email_status = f"email skipped: {e}"
 
-            finally:
-                context.close(); browser.close()
+                            if email_status:
+                                payload["email_status"] = email_status
+
+                        except PWTimeout as e:
+                            payload.update({"ok": False, "error": f"Timeout: {e}"})
+                            if DEBUG_ARTIFACTS:
+                                base = f"row_{i}_{r.get('Γ.Α.Κ. Αριθμός','')}_{r.get('Γ.Α.Κ. Έτος','')}_w{worker_id}"
+                                _dump_dom(page, base)
+                        except Exception as e:
+                            payload.update({"ok": False, "error": f"Σφάλμα: {e}"})
+                            if DEBUG_ARTIFACTS:
+                                base = f"row_{i}_{r.get('Γ.Α.Κ. Αριθμός','')}_{r.get('Γ.Α.Κ. Έτος','')}_w{worker_id}"
+                                _dump_dom(page, base)
+
+                        out_q.put(payload)
+                finally:
+                    context.close(); browser.close()
+            out_q.put({"__worker_done__": worker_id})
+
+        threads = [Thread(target=worker, args=(wid,), daemon=True) for wid in range(1, BATCH_WORKERS+1)]
+        for t in threads: t.start()
+
+        done_workers = 0
+        while done_workers < BATCH_WORKERS:
+            item = out_q.get()
+            if isinstance(item, dict) and item.get("__worker_done__"):
+                done_workers += 1
+                continue
+            yield "data: " + json.dumps(item, ensure_ascii=False) + "\n\n"
+
     return Response(_stream(), mimetype="text/event-stream")
 
 # ---------------- MAIN ---------------- #
