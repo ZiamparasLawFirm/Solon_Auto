@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-SOLON Web App (single + batch από Excel + email + Excel preview + .env column mapping)
+ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.0
+Single-browser app: single + batch από Excel + email + .env options
+(Χωρίς προεπισκόπηση Excel)
 
-Fix:
-- Playwright wait_for_function: περνάμε το arg ΜΟΝΟ ως keyword (arg=...).
-- Πάντα σώζουμε artifacts (hdr/db/table) με DEBUG_ARTIFACTS=1 ακόμη κι αν προκύψει σφάλμα.
-- Matcher χωρίς headers, αναμονή spinner/cycle και αναζήτηση ακριβούς γραμμής ΓΑΚ/Έτος.
-
-Εγκατάσταση:
+Απαιτήσεις:
     pip install flask playwright pandas openpyxl python-dotenv
     python -m playwright install
 
@@ -15,16 +12,20 @@ Fix:
     SENDER_EMAIL=your@gmail.com
     RECEIVER_EMAIL=your@gmail.com
     GOOGLE_APP_PASSWORD=app_password
-    # Optional:
-    # SMTP_HOST=smtp.gmail.com
-    # SMTP_PORT=465
-    # HEADLESS=1            # 0 για ορατό browser
-    # EXCEL_SHEET=Sheet1
-    # COL_CLIENT=Πελάτης
-    # COL_COURT=Δικαστήριο
-    # COL_GAK_NUM=Γ.Α.Κ. Αριθμός
-    # COL_GAK_YEAR=Γ.Α.Κ. Έτος
-    # DEBUG_ARTIFACTS=1
+    # Απόδοση:
+    HEADLESS=1
+    BLOCK_MEDIA=1
+    FAST_MODE=1
+    RESULT_TIMEOUT_MS=60000
+    EARLY_NO_DATA_MS=4000
+    # Excel (προαιρετικά):
+    EXCEL_SHEET=Sheet1
+    COL_CLIENT=Πελάτης
+    COL_COURT=Δικαστήριο
+    COL_GAK_NUM=Γ.Α.Κ. Αριθμός
+    COL_GAK_YEAR=Γ.Α.Κ. Έτος
+    # Debug:
+    DEBUG_ARTIFACTS=0
 """
 
 from flask import Flask, request, render_template_string, jsonify, Response
@@ -34,10 +35,8 @@ from dotenv import load_dotenv, find_dotenv
 import pandas as pd
 import unicodedata, re, os, json, smtplib, time
 
-# Φόρτωση .env
 load_dotenv(find_dotenv(), override=True)
 
-# ---------------- ΡΥΘΜΙΣΕΙΣ / SELECTORS ---------------- #
 URL = "https://extapps.solon.gov.gr/mojwp/faces/TrackLdoPublic"
 
 # ADF ids (προσοχή στα ':' → CSS escapes με '\\:')
@@ -53,13 +52,14 @@ SEL_GRID_HDR    = "#pc1\\:ldoTable\\:\\:hdr"
 SEL_GRID_SPIN   = "#pc1\\:ldoTable\\:\\:sm"   # «Ανάκτηση δεδομένων...»
 SEL_GRID_TABLE  = "#pc1\\:ldoTable"
 
-DEFAULT_TIMEOUT = 30_000   # ms
-RESULT_TIMEOUT  = 60_000   # ms
+# Χρόνοι από .env
+DEFAULT_TIMEOUT = 30_000
+RESULT_TIMEOUT  = int(os.getenv("RESULT_TIMEOUT_MS", "60000"))
+EARLY_NO_DATA_MS = int(os.getenv("EARLY_NO_DATA_MS", "4000"))
 
 EXCEL_FILE  = "SOLON_INPUT.xlsx"
-EXCEL_SHEET = os.getenv("EXCEL_SHEET")  # optional συγκεκριμένο φύλλο
+EXCEL_SHEET = os.getenv("EXCEL_SHEET")
 
-# Email από .env (defaults)
 RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL", "dimitris.ziamparas@gmail.com")
 SENDER_EMAIL   = os.getenv("SENDER_EMAIL",   RECEIVER_EMAIL)
 SMTP_HOST      = os.getenv("SMTP_HOST", "smtp.gmail.com")
@@ -70,13 +70,11 @@ APP_PASSWORD   = (
     or os.getenv("APP_PASSWORD")
 )
 
-# Headless toggle (HEADLESS=0 για ορατό browser)
-HEADLESS = os.getenv("HEADLESS", "1").lower() not in ("0", "false", "no")
-
-# Debug artifacts
+HEADLESS      = os.getenv("HEADLESS", "1").lower() not in ("0","false","no")
+BLOCK_MEDIA   = os.getenv("BLOCK_MEDIA", "0").lower() in ("1","true","yes")
+FAST_MODE     = os.getenv("FAST_MODE", "0").lower() in ("1","true","yes")
 DEBUG_ARTIFACTS = os.getenv("DEBUG_ARTIFACTS", "0").lower() in ("1","true","yes")
 
-# Προαιρετικό manual mapping από .env
 ENV_COL_CLIENT = os.getenv("COL_CLIENT")
 ENV_COL_COURT  = os.getenv("COL_COURT")
 ENV_COL_GAKNUM = os.getenv("COL_GAK_NUM")
@@ -84,7 +82,7 @@ ENV_COL_GAKYEAR= os.getenv("COL_GAK_YEAR")
 
 app = Flask(__name__)
 
-# ---------------- ΒΟΗΘΗΤΙΚΑ ---------------- #
+# ---------------- Helpers ---------------- #
 def _accept_cookies_if_present(page):
     for loc in [
         page.get_by_role("button", name="Αποδοχή"),
@@ -96,7 +94,7 @@ def _accept_cookies_if_present(page):
         try:
             if loc.count() and loc.first.is_visible() and loc.first.is_enabled():
                 loc.first.click()
-                page.wait_for_timeout(200)
+                page.wait_for_timeout(150)
                 break
         except Exception:
             pass
@@ -119,18 +117,35 @@ def _is_meaningful_result(text):
     if _looks_like_header(t): return False
     return True
 
-def _choose_option_value(page, select_css: str, desired_label: str) -> str:
-    desired_norm = _normalize(desired_label)
-    options = page.locator(f"{select_css} option")
-    texts   = options.all_text_contents()
-    values  = options.evaluate_all("els => els.map(e => e.value)")
-    for t, v in zip(texts, values):
-        if _normalize(t) == desired_norm:
-            return v
-    for t, v in zip(texts, values):
-        if desired_norm and desired_norm in _normalize(t):
-            return v
-    raise ValueError("Δεν βρέθηκε το ζητούμενο δικαστήριο στη λίστα του SOLON.")
+def _ensure_artifacts_dir():
+    if DEBUG_ARTIFACTS and not os.path.exists("artifacts"):
+        os.makedirs("artifacts", exist_ok=True)
+
+def _dump_dom(page, base_name: str):
+    if not DEBUG_ARTIFACTS:
+        return
+    _ensure_artifacts_dir()
+    try:
+        hdr = page.evaluate("(sel)=>{const n=document.querySelector(sel); return n? n.outerHTML : ''}", SEL_GRID_HDR)
+        db  = page.evaluate("(sel)=>{const n=document.querySelector(sel); return n? n.outerHTML : ''}", SEL_GRID_DB)
+        tbl = page.evaluate("(sel)=>{const n=document.querySelector(sel); return n? n.outerHTML : ''}", SEL_GRID_TABLE)
+        with open(f"artifacts/{base_name}_hdr.html", "w", encoding="utf-8") as f:
+            f.write(hdr or "")
+        with open(f"artifacts/{base_name}_db.html", "w", encoding="utf-8") as f:
+            f.write(db or "")
+        with open(f"artifacts/{base_name}_table.html", "w", encoding="utf-8") as f:
+            f.write(tbl or "")
+    except Exception:
+        pass
+
+def _route_blocker(route):
+    try:
+        if route.request.resource_type in ("image","media","font"):
+            return route.abort()
+        return route.continue_()
+    except Exception:
+        try: route.continue_()
+        except Exception: pass
 
 def _get_db_text(page) -> str:
     try:
@@ -139,7 +154,6 @@ def _get_db_text(page) -> str:
         return ""
 
 def _wait_spinner_cycle_if_any(page):
-    # Προσπάθησε να δεις spinner -> κρύψιμο
     try:
         page.wait_for_selector(SEL_GRID_SPIN, state="visible", timeout=2_000)
     except Exception:
@@ -150,7 +164,6 @@ def _wait_spinner_cycle_if_any(page):
         pass
 
 def _wait_for_table_ready(page, timeout_ms=RESULT_TIMEOUT):
-    """Περιμένει να είναι έτοιμο το data-body: είτε έχει td είτε γράφει 'Δεν υπάρχουν δεδομένα'."""
     page.wait_for_selector(SEL_GRID, state="visible", timeout=DEFAULT_TIMEOUT)
     page.wait_for_function(
         """
@@ -168,7 +181,6 @@ def _wait_for_table_ready(page, timeout_ms=RESULT_TIMEOUT):
     )
 
 def _wait_for_table_change(page, prev_sig: str, timeout_ms=RESULT_TIMEOUT):
-    """Περιμένει να αλλάξει το textContent του ::db σε σχέση με το προηγούμενο."""
     try:
         page.wait_for_function(
             """
@@ -184,95 +196,107 @@ def _wait_for_table_change(page, prev_sig: str, timeout_ms=RESULT_TIMEOUT):
             timeout=timeout_ms // 2
         )
     except Exception:
-        pass  # αν δεν αλλάξει, συνεχίζουμε
-
-def _ensure_artifacts_dir():
-    if DEBUG_ARTIFACTS and not os.path.exists("artifacts"):
-        os.makedirs("artifacts", exist_ok=True)
-
-def _dump_dom(page, base_name: str):
-    """Σώζει hdr, db και full table σε ξεχωριστά html αρχεία όταν DEBUG_ARTIFACTS=1."""
-    if not DEBUG_ARTIFACTS:
-        return
-    _ensure_artifacts_dir()
-    try:
-        hdr = page.evaluate("(sel)=>{const n=document.querySelector(sel); return n? n.outerHTML : ''}", SEL_GRID_HDR)
-        db  = page.evaluate("(sel)=>{const n=document.querySelector(sel); return n? n.outerHTML : ''}", SEL_GRID_DB)
-        tbl = page.evaluate("(sel)=>{const n=document.querySelector(sel); return n? n.outerHTML : ''}", SEL_GRID_TABLE)
-        with open(f"artifacts/{base_name}_hdr.html", "w", encoding="utf-8") as f:
-            f.write(hdr or "")
-        with open(f"artifacts/{base_name}_db.html", "w", encoding="utf-8") as f:
-            f.write(db or "")
-        with open(f"artifacts/{base_name}_table.html", "w", encoding="utf-8") as f:
-            f.write(tbl or "")
-    except Exception:
         pass
 
-def _clear_and_fill(page, selector: str, value: str):
-    loc = page.locator(selector)
-    loc.click()
-    try:
-        loc.fill("")  # καθάρισμα
-    except Exception:
-        pass
-    loc.type(str(value), delay=10)  # λίγο delay για ADF
-    page.wait_for_timeout(60)
-
-# ---------- Κύριος matcher ΜΟΝΟ από ::db (χωρίς headers) ---------- #
-def _read_decision_from_db(page, gak_num: str, gak_year: str) -> str:
-    """
-    Βρες στο ::db τη γραμμή (tr) όπου:
-      - είτε ΥΠΑΡΧΟΥΝ ΚΕΛΙΑ με ακριβώς `gak_num` ΚΑΙ ακριβώς `gak_year`
-      - είτε υπάρχει κελί με pattern `gak_num/gak_year`
-    Μετά πάρε το διατακτικό από c10 (ή κενό αν δεν υπάρχει).
-    """
-    js = r"""
-    (args) => {
-      const { dbSel, num, year } = args;
-      const db = document.querySelector(dbSel);
-      if (!db) return null;
-
-      const norm = s => (s||'').toString().replace(/\u00A0/g,' ').replace(/\s+/g,' ').trim();
-      const needleNum  = norm(num);
-      const needleYear = norm(year);
-      const rxCombined = new RegExp('^\\s*'+needleNum.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\s*/\\s*'+needleYear.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\s*$');
-
-      const rows = Array.from(db.querySelectorAll('tr'));
-      for (const tr of rows) {
-        const tds = Array.from(tr.querySelectorAll('td'));
-        if (!tds.length) continue;
-
-        const decTd = tr.querySelector("td[id$=':c10']");
-        const otherTds = tds.filter(td => td !== decTd);
-        const texts = otherTds.map(td => norm(td.innerText));
-
-        const hasNumExact  = texts.some(t => t === needleNum);
-        const hasYearExact = texts.some(t => t === needleYear);
-        const hasCombined  = texts.some(t => rxCombined.test(t));
-
-        if ((hasNumExact && hasYearExact) || hasCombined) {
-          const val = decTd ? norm(decTd.innerText) : "";
-          return val || "";
+def _wait_clickable(page, selector: str, timeout_ms=5_000):
+    page.locator(selector).scroll_into_view_if_needed()
+    page.wait_for_function(
+        """
+        (sel) => {
+          const el = document.querySelector(sel);
+          if (!el) return false;
+          const r = el.getBoundingClientRect();
+          const cx = r.left + r.width/2;
+          const cy = r.top  + r.height/2;
+          const top = document.elementFromPoint(cx, cy);
+          return top && (top === el || el.contains(top));
         }
-      }
-      return null;
-    }
-    """
+        """,
+        arg=selector,
+        timeout=timeout_ms
+    )
+
+def _set_input_value(page, selector: str, value: str):
+    # αξιόπιστη εισαγωγή τιμής χωρίς να κολλάμε σε overlays (ADF)
     try:
-        val = page.evaluate(js, {"dbSel": SEL_GRID_DB, "num": str(gak_num).strip(), "year": str(gak_year).strip()})
-        if val and _is_meaningful_result(val):
-            return val
+        _wait_clickable(page, selector, timeout_ms=5_000)
     except Exception:
         pass
-    return ""
+    ok = False
+    try:
+        ok = page.evaluate(
+            """(args) => {
+                const el = document.querySelector(args.sel);
+                if (!el) return false;
+                el.focus();
+                el.value = '';
+                el.dispatchEvent(new Event('input', {bubbles:true}));
+                el.value = String(args.val ?? '');
+                el.dispatchEvent(new Event('input', {bubbles:true}));
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+                return true;
+            }""",
+            {"sel": selector, "val": str(value)}
+        ) or False
+        page.wait_for_timeout(40)
+        try: page.locator(selector).press("Tab")
+        except Exception: pass
+        page.wait_for_timeout(60)
+    except Exception:
+        ok = False
+    if ok: return
+    loc = page.locator(selector)
+    try:
+        loc.fill(str(value))
+        page.wait_for_timeout(60)
+        try: loc.press("Tab")
+        except Exception: pass
+        return
+    except Exception:
+        pass
+    try:
+        loc.click(force=True)
+        loc.press("Control+A"); loc.press("Delete")
+        if FAST_MODE: loc.type(str(value))
+        else: loc.type(str(value), delay=10)
+        page.wait_for_timeout(60)
+        try: loc.press("Tab")
+        except Exception: pass
+    except Exception:
+        page.evaluate(
+            """(args) => {
+                const el = document.querySelector(args.sel);
+                if (!el) return false;
+                el.value = String(args.val ?? '');
+                el.dispatchEvent(new Event('input', {bubbles:true}));
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+                return true;
+            }""",
+            {"sel": selector, "val": str(value)}
+        )
+        page.wait_for_timeout(60)
 
+# ---------------- Court cache ---------------- #
+def _build_court_map(page):
+    options = page.locator(f"{SEL_KATASTIMA} option")
+    texts   = options.all_text_contents()
+    values  = options.evaluate_all("els => els.map(e => e.value)")
+    out = {}
+    for t, v in zip(texts, values):
+        out[_normalize(t)] = (t.strip(), v)
+    return out
+
+def _get_court_value(court_map, label):
+    n = _normalize(label)
+    if n in court_map:
+        return court_map[n][1]
+    for key,(t,v) in court_map.items():
+        if n and n in key:
+            return v
+    raise ValueError("Δεν βρέθηκε το ζητούμενο δικαστήριο στη λίστα του SOLON.")
+
+# ---------- Matchers στο ::db ---------- #
 def _wait_for_target_row_and_read(page, gak_num: str, gak_year: str, timeout_ms=RESULT_TIMEOUT) -> str:
-    """
-    Περιμένει μέχρι να εμφανιστεί στο ::db γραμμή που:
-    - έχει κελί ακριβώς 'gak_num/gak_year', ή
-    - έχει *ξεχωριστά* κελιά με ακριβώς gak_num και ακριβώς gak_year.
-    Όταν τη βρει, επιστρέφει το κείμενο της στήλης c10 της ίδιας γραμμής (ή κενό).
-    """
     js = r"""
     (args) => {
       const { dbSel, num, year } = args;
@@ -282,7 +306,8 @@ def _wait_for_target_row_and_read(page, gak_num: str, gak_year: str, timeout_ms=
       const norm = s => (s||'').toString().replace(/\u00A0/g,' ').replace(/\s+/g,' ').trim();
       const needleNum  = norm(num);
       const needleYear = norm(year);
-      const rxCombined = new RegExp('^\\s*'+needleNum.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\s*/\\s*'+needleYear.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\s*$');
+      const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+      const rxCombined = new RegExp('^\\s*'+esc(needleNum)+'\\s*/\\s*'+esc(needleYear)+'\\s*$');
 
       const rows = Array.from(db.querySelectorAll('tr'));
       for (const tr of rows) {
@@ -307,59 +332,100 @@ def _wait_for_target_row_and_read(page, gak_num: str, gak_year: str, timeout_ms=
     }
     """
     deadline = time.time() + (timeout_ms/1000.0)
+    first_no_data_at = None
     while time.time() < deadline:
         res = page.evaluate(js, {"dbSel": SEL_GRID_DB, "num": str(gak_num).strip(), "year": str(gak_year).strip()})
-        if res and res.get("found") and _is_meaningful_result(res.get("value","")):
-            return res.get("value","").strip()
+        if res and res.get("found"):
+            val = (res.get("value") or "").strip()
+            if _is_meaningful_result(val):
+                return val
+
+        if res and res.get("noData"):
+            if FAST_MODE:
+                if first_no_data_at is None:
+                    first_no_data_at = time.time()
+                elif (time.time() - first_no_data_at) * 1000 >= EARLY_NO_DATA_MS:
+                    return ""
+        else:
+            first_no_data_at = None
 
         _wait_spinner_cycle_if_any(page)
-        page.wait_for_timeout(250)
+        page.wait_for_timeout(200 if FAST_MODE else 300)
 
     return ""
 
-# ---------- SCRAPE ---------- #
+# ---------- SCRAPE (single-run) ---------- #
 def _scrape_one(page, court_label: str, gak_num: str, gak_year: str):
-    """Τρέχει ΜΙΑ αναζήτηση στο SOLON με ήδη ανοιχτό page."""
     base_art = f"after_{gak_num}_{gak_year}"
     try:
         page.goto(URL, wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle")
         _accept_cookies_if_present(page)
 
-        # Επιλογή δικαστηρίου (native <select>)
-        page.wait_for_selector(SEL_KATASTIMA, state="visible", timeout=DEFAULT_TIMEOUT)
-        value = _choose_option_value(page, SEL_KATASTIMA, court_label)
+        court_map = _build_court_map(page)
+        value = _get_court_value(court_map, court_label)
         page.select_option(SEL_KATASTIMA, value=value)
-        page.wait_for_timeout(120)  # μικρή ανάσα
+        page.wait_for_timeout(80)
 
-        # Συμπλήρωση ΓΑΚ/Έτος + blur
-        _clear_and_fill(page, SEL_GAK_NUMBER, str(gak_num).strip())
-        _clear_and_fill(page, SEL_GAK_YEAR,   str(gak_year).strip())
-        page.locator(SEL_GAK_YEAR).press("Tab")
-        page.wait_for_timeout(120)
+        _set_input_value(page, SEL_GAK_NUMBER, str(gak_num).strip())
+        _set_input_value(page, SEL_GAK_YEAR,   str(gak_year).strip())
 
-        # Υπόμνημα πριν το κλικ
         prev_sig = _get_db_text(page)
 
-        # Κλικ «Αναζήτηση»
         btn = page.locator(SEL_SEARCH_BTN)
         if not (btn.count() and btn.first.is_visible()):
             return {"ok": False, "error": "Δεν βρέθηκε το κουμπί «Αναζήτηση»."}
         btn.first.click()
 
-        # Περιμένω έτοιμο πίνακα & πιθανό spinner
         _wait_for_table_ready(page, timeout_ms=RESULT_TIMEOUT)
         _wait_for_table_change(page, prev_sig, timeout_ms=RESULT_TIMEOUT)
         _wait_spinner_cycle_if_any(page)
 
-        # Περιμένω τη συγκεκριμένη γραμμή κι επιστρέφω διατακτικό
         result = _wait_for_target_row_and_read(page, gak_num, gak_year, timeout_ms=RESULT_TIMEOUT)
-
         return {"ok": True, "result": result}
     finally:
         if DEBUG_ARTIFACTS:
             _dump_dom(page, base_art)
 
+# ---------- SCRAPE (batch, single navigation) ---------- #
+def _prepare_page_for_batch(context):
+    page = context.new_page()
+    page.set_default_timeout(DEFAULT_TIMEOUT)
+    page.goto(URL, wait_until="domcontentloaded")
+    page.wait_for_load_state("networkidle")
+    _accept_cookies_if_present(page)
+    court_map = _build_court_map(page)
+    return page, court_map
+
+def _search_on_prepared_page(page, court_value: str, gak_num: str, gak_year: str):
+    base_art = f"after_{gak_num}_{gak_year}"
+    try:
+        current = page.locator(SEL_KATASTIMA).evaluate("el => el.value")
+        if current != court_value:
+            page.select_option(SEL_KATASTIMA, value=court_value)
+            page.wait_for_timeout(60)
+
+        _set_input_value(page, SEL_GAK_NUMBER, str(gak_num).strip())
+        _set_input_value(page, SEL_GAK_YEAR,   str(gak_year).strip())
+
+        prev_sig = _get_db_text(page)
+
+        btn = page.locator(SEL_SEARCH_BTN)
+        if not (btn.count() and btn.first.is_visible()):
+            return {"ok": False, "error": "Δεν βρέθηκε το κουμπί «Αναζήτηση»."}
+        btn.first.click()
+
+        _wait_for_table_ready(page, timeout_ms=RESULT_TIMEOUT)
+        _wait_for_table_change(page, prev_sig, timeout_ms=RESULT_TIMEOUT)
+        _wait_spinner_cycle_if_any(page)
+
+        result = _wait_for_target_row_and_read(page, gak_num, gak_year, timeout_ms=RESULT_TIMEOUT)
+        return {"ok": True, "result": result}
+    finally:
+        if DEBUG_ARTIFACTS:
+            _dump_dom(page, base_art)
+
+# ---------- Email ---------- #
 def _send_email(subject: str, body: str):
     if not APP_PASSWORD:
         return (False, "Λείπει το GOOGLE_APP_PASSWORD/GMAIL_APP_PASSWORD στο .env.")
@@ -376,7 +442,7 @@ def _send_email(subject: str, body: str):
     except Exception as e:
         return (False, f"Σφάλμα αποστολής: {e}")
 
-# ---------- Excel helpers ---------- #
+# ---------- Excel ---------- #
 HEADER_ALIASES = {
     "Πελάτης": {"πελατης","pelatis","client","customer","onoma","onoma pelati","pelaths","pelatis name","onoma pelath","πελάτης"},
     "Δικαστήριο": {"δικαστηριο","dikasthrio","court","δικαστήριο"},
@@ -459,39 +525,13 @@ def _load_excel_rows(path=EXCEL_FILE):
             errors.append(f"{sheet}: {e}")
     raise ValueError("Δεν εντοπίστηκαν οι απαιτούμενες στήλες σε κανένα φύλλο του Excel.\n" + "\n".join(errors))
 
-def _excel_preview(path=EXCEL_FILE):
-    if not os.path.exists(path):
-        return {"ok": False, "error": f"Δεν βρέθηκε το {path}"}
-    try:
-        xls = pd.ExcelFile(path, engine="openpyxl")
-    except Exception as e:
-        return {"ok": False, "error": f"Σφάλμα ανάγνωσης Excel: {e}"}
-    out = {"ok": True, "sheets": []}
-    for sheet in xls.sheet_names:
-        try:
-            df0 = pd.read_excel(xls, sheet_name=sheet, engine="openpyxl", dtype=str).fillna("")
-            headers0 = list(df0.columns.astype(str))
-        except Exception:
-            headers0 = []
-        try:
-            df_raw = pd.read_excel(xls, sheet_name=sheet, engine="openpyxl", dtype=str, header=None).fillna("")
-            first10 = df_raw.head(10).astype(str).values.tolist()
-        except Exception:
-            first10 = []
-        out["sheets"].append({
-            "name": sheet,
-            "headers_guess": headers0,
-            "first10rows": first10
-        })
-    return out
-
-# ---------------- WEB UI ---------------- #
+# ---------------- WEB UI (single-column layout) ---------------- #
 PAGE_HTML = """
 <!doctype html>
 <html lang="el">
 <head>
 <meta charset="utf-8">
-<title>SOLON – Γ.Α.Κ. Αναζήτηση</title>
+<title>ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.0</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f6f7fb;margin:0}
@@ -513,14 +553,11 @@ PAGE_HTML = """
   .item:last-child{border-bottom:none}
   .muted{color:#777}
   code{background:#f3f3f3;padding:2px 6px;border-radius:6px}
-  table{border-collapse:collapse;width:100%;font-size:13px}
-  th,td{border:1px solid #e8e8e8;padding:6px 8px;text-align:left}
-  .scroll{max-height:260px;overflow:auto;border:1px solid #eee;border-radius:8px}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>SOLON – «Αριθμός Απόφασης/Έτος - Είδος Διατακτικού»</h1>
+  <h1>ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.0</h1>
 
   <h3>Μονή Αναζήτηση</h3>
   <form id="single">
@@ -538,34 +575,27 @@ PAGE_HTML = """
     </div>
     <div class="actions">
       <button type="submit" id="go">Αναζήτηση</button>
-      <button type="button" id="preview" class="secondary">Προεπισκόπηση Excel</button>
     </div>
   </form>
   <div id="out" class="result" style="display:none"></div>
 
-  <div id="previewBox" class="result" style="display:none;margin-top:12px"></div>
-
   <hr style="margin:28px 0">
 
   <h3>Batch από Excel</h3>
-  <p>Αρχείο: <code>SOLON_INPUT.xlsx</code> (στον ίδιο φάκελο). Μπορείς είτε να:
-     <br>• αφήσεις το app να κάνει auto-detect κεφαλίδων, είτε
-     <br>• ορίσεις στο <code>.env</code> τα <code>COL_CLIENT</code>, <code>COL_COURT</code>, <code>COL_GAK_NUM</code>, <code>COL_GAK_YEAR</code>.</p>
+  <p><b>Αρχείο: <code>SOLON_INPUT.xlsx</code> για μαζική εισαγωγή ΓΑΚ (στον ίδιο φάκελο)</b>.</p>
   <div class="actions">
     <button id="runBatch">Τρέξε από Excel</button>
   </div>
   <div id="stream" class="list" style="display:none"></div>
 
   <p class="muted">Emails στέλνονται ΜΟΝΟ για μη κενά/ουσιαστικά αποτελέσματα στον
-    <code>{{recv}}</code>. Ρύθμισε το <code>GOOGLE_APP_PASSWORD</code> (ή GMAIL_APP_PASSWORD) στο .env.</p>
+    <code>{{recv}}</code>.</p>
 </div>
 
 <script>
 const form = document.getElementById('single');
 const go = document.getElementById('go');
 const out = document.getElementById('out');
-const previewBtn = document.getElementById('preview');
-const previewBox = document.getElementById('previewBox');
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -585,7 +615,7 @@ form.addEventListener('submit', async (e) => {
     const data = await r.json();
     out.style.display='block';
     if (data.ok) {
-      out.innerHTML = '<b>Αποτέλεσμα:</b> ' + (data.result || '<span class="muted">— κενό —</span>');
+      out.innerHTML = '<b>Αριθμός Aπόφασης/\\'Ετος - Είδος Διατακτικού:</b> ' + (data.result || '<span class="muted">— κενό —</span>');
     } else {
       out.classList.add('error');
       out.innerHTML = '<b>Σφάλμα:</b> ' + (data.error || 'Άγνωστο σφάλμα');
@@ -595,36 +625,6 @@ form.addEventListener('submit', async (e) => {
     out.textContent = 'Σφάλμα δικτύου/διακομιστή.';
   } finally {
     go.disabled=false; go.textContent='Αναζήτηση';
-  }
-});
-
-previewBtn.addEventListener('click', async () => {
-  previewBox.style.display = 'block';
-  previewBox.innerHTML = 'Φόρτωση προεπισκόπησης…';
-  try {
-    const r = await fetch('/api/preview_excel');
-    const data = await r.json();
-    if (!data.ok) {
-      previewBox.innerHTML = '<b>Σφάλμα:</b> ' + (data.error||'');
-      return;
-    }
-    let html = '';
-    data.sheets.forEach(s => {
-      html += '<h4>Φύλλο: '+s.name+'</h4>';
-      html += '<div><b>Κεφαλίδες (header=0):</b> '+ (s.headers_guess && s.headers_guess.length ? s.headers_guess.join(' | ') : '<i>—</i>') + '</div>';
-      if (s.first10rows && s.first10rows.length) {
-        html += '<div class="scroll"><table><thead><tr><th>#</th><th>Στήλες τιμών (πρώτες 10 γραμμές, raw)</th></tr></thead><tbody>';
-        s.first10rows.forEach((row,i)=>{
-          const rowText = row.join(' | ');
-          html += '<tr><td>'+i+'</td><td>'+rowText+'</td></tr>';
-        });
-        html += '</tbody></table></div>';
-      }
-    });
-    html += '<p class="muted">Αν δεν αναγνωρίζονται οι στήλες, βάλε στο .env τις μεταβλητές <code>COL_CLIENT</code>, <code>COL_COURT</code>, <code>COL_GAK_NUM</code>, <code>COL_GAK_YEAR</code> με <b>ακριβώς</b> τα ονόματα όπως εμφανίζονται στις κεφαλίδες του Excel.</p>';
-    previewBox.innerHTML = html;
-  } catch (err) {
-    previewBox.innerHTML = '<b>Σφάλμα προεπισκόπησης.</b>';
   }
 });
 
@@ -659,7 +659,8 @@ runBtn.addEventListener('click', async () => {
       const res = row.ok ? (row.result || '<span class="muted">— κενό —</span>')
                          : ('<span class="muted">Σφάλμα: '+(row.error||'')+'</span>');
       const mail = row.email_status ? (' <span class="muted">('+row.email_status+')</span>') : '';
-      div.innerHTML = '<b>'+Pelatis+'</b> — '+Dikastirio+' — ΓΑΚ '+GakNum+'/'+GakYear+'<br>Αποτέλεσμα: '+res+mail;
+      div.innerHTML = '<b>'+Pelatis+'</b> — '+Dikastirio+' — ΓΑΚ '+GakNum+'/'+GakYear+
+                      '<br><b>Αριθμός Aπόφασης/\\'Ετος - Είδος Διατακτικού:</b> '+res+mail;
       streamBox.appendChild(div);
       streamBox.scrollTop = streamBox.scrollHeight;
     } catch(e){}
@@ -679,10 +680,6 @@ runBtn.addEventListener('click', async () => {
 def index():
     return render_template_string(PAGE_HTML, recv=RECEIVER_EMAIL)
 
-@app.get("/api/preview_excel")
-def api_preview_excel():
-    return jsonify(_excel_preview(EXCEL_FILE))
-
 @app.post("/api/search")
 def api_search():
     data = request.get_json(force=True, silent=True) or {}
@@ -694,8 +691,10 @@ def api_search():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
-        ctx = browser.new_context(locale="el-GR", viewport={"width":1500,"height":950})
-        page = ctx.new_page()
+        context = browser.new_context(locale="el-GR", viewport={"width":1500,"height":950})
+        if BLOCK_MEDIA:
+            context.route("**/*", _route_blocker)
+        page = context.new_page()
         page.set_default_timeout(DEFAULT_TIMEOUT)
         try:
             res = _scrape_one(page, court, gak_num, gak_year)
@@ -704,7 +703,7 @@ def api_search():
         except Exception as e:
             res = {"ok": False, "error": f"Σφάλμα: {e}"}
         finally:
-            ctx.close(); browser.close()
+            context.close(); browser.close()
     return jsonify(res)
 
 @app.get("/api/batch")
@@ -718,21 +717,32 @@ def api_batch():
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=HEADLESS)
-            ctx = browser.new_context(locale="el-GR", viewport={"width":1500,"height":950})
-            page = ctx.new_page()
-            page.set_default_timeout(DEFAULT_TIMEOUT)
+            context = browser.new_context(locale="el-GR", viewport={"width":1500,"height":950})
+            if BLOCK_MEDIA:
+                context.route("**/*", _route_blocker)
+
             try:
+                # Προετοιμασία: μία φορά navigation και cache courts
+                page, court_map = _prepare_page_for_batch(context)
+
                 for i, r in enumerate(rows, start=1):
                     payload = {**r}
                     try:
-                        res = _scrape_one(page, r.get("Δικαστήριο",""), r.get("Γ.Α.Κ. Αριθμός",""), r.get("Γ.Α.Κ. Έτος",""))
+                        court_value = _get_court_value(court_map, r.get("Δικαστήριο",""))
+                        res = _search_on_prepared_page(
+                            page, court_value,
+                            r.get("Γ.Α.Κ. Αριθμός",""),
+                            r.get("Γ.Α.Κ. Έτος","")
+                        )
                         payload.update(res)
+
                         if DEBUG_ARTIFACTS:
                             _ensure_artifacts_dir()
                             base = f"row_{i}_{r.get('Γ.Α.Κ. Αριθμός','')}_{r.get('Γ.Α.Κ. Έτος','')}"
                             with open(f"artifacts/{base}.json","w",encoding="utf-8") as f:
                                 json.dump(res, f, ensure_ascii=False, indent=2)
                             _dump_dom(page, base)
+
                     except PWTimeout as e:
                         payload.update({"ok": False, "error": f"Timeout: {e}"})
                         if DEBUG_ARTIFACTS:
@@ -744,12 +754,12 @@ def api_batch():
                             base = f"row_{i}_{r.get('Γ.Α.Κ. Αριθμός','')}_{r.get('Γ.Α.Κ. Έτος','')}"
                             _dump_dom(page, base)
 
-                    # Email ΜΟΝΟ για ουσιαστικό αποτέλεσμα
+                    # Email μόνο για ουσιαστικό αποτέλεσμα
                     email_status = None
                     try:
                         if payload.get("ok") and _is_meaningful_result(payload.get("result")):
                             subject = (
-                                f"SOLON • {r.get('Πελάτης','')}"
+                                f"ΣΟΛΩΝ • {r.get('Πελάτης','')}"
                                 f" • {r.get('Δικαστήριο','')}"
                                 f" • ΓΑΚ {r.get('Γ.Α.Κ. Αριθμός','')}/{r.get('Γ.Α.Κ. Έτος','')}"
                             )
@@ -769,8 +779,9 @@ def api_batch():
                         payload["email_status"] = email_status
 
                     yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
             finally:
-                ctx.close(); browser.close()
+                context.close(); browser.close()
     return Response(_stream(), mimetype="text/event-stream")
 
 # ---------------- MAIN ---------------- #
