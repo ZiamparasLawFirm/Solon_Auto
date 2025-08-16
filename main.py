@@ -1,36 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.4
-Single-browser για μονή αναζήτηση • Batch με παράλληλους browsers (BATCH_WORKERS)
-Fix: Ανθεκτικό click στο «Αναζήτηση» (overlay-safe) για αποφυγή Timeout: subtree intercepts pointer events.
+ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.5
+Single για μονή αναζήτηση • Batch με παράλληλους browsers (BATCH_WORKERS)
+ΝΕΟ: Αυτόματο κλείσιμο του popup «Δεν βρέθηκαν δεδομένα…» (πατάει OK)
+και αυτόματο accept σε browser dialogs.
 
 Απαιτήσεις:
     pip install flask playwright pandas openpyxl python-dotenv
     python -m playwright install
 
-.env (δίπλα στο app.py):
+.env:
     SENDER_EMAIL=your@gmail.com
     RECEIVER_EMAIL=your@gmail.com
     GOOGLE_APP_PASSWORD=app_password
 
-    # Απόδοση:
     HEADLESS=1
     BLOCK_MEDIA=1
     FAST_MODE=1
     RESULT_TIMEOUT_MS=60000
     EARLY_NO_DATA_MS=4000
 
-    # Παράλληλη εκτέλεση batch:
     BATCH_WORKERS=4
 
-    # Excel (προαιρετικά):
     EXCEL_SHEET=Sheet1
     COL_CLIENT=Πελάτης
     COL_COURT=Δικαστήριο
     COL_GAK_NUM=Γ.Α.Κ. Αριθμός
     COL_GAK_YEAR=Γ.Α.Κ. Έτος
 
-    # Debug:
     DEBUG_ARTIFACTS=0
 """
 
@@ -57,7 +54,7 @@ SEL_SEARCH_BTN  = "#ldoSearch a"
 SEL_GRID        = "#pc1\\:ldoTable"
 SEL_GRID_DB     = "#pc1\\:ldoTable\\:\\:db"
 SEL_GRID_HDR    = "#pc1\\:ldoTable\\:\\:hdr"
-SEL_GRID_SPIN   = "#pc1\\:ldoTable\\:\\:sm"   # «Ανάκτηση δεδομένων...»
+SEL_GRID_SPIN   = "#pc1\\:ldoTable\\:\\:sm"
 SEL_GRID_TABLE  = "#pc1\\:ldoTable"
 
 # Χρόνοι από .env
@@ -107,6 +104,13 @@ def _accept_cookies_if_present(page):
                 break
         except Exception:
             pass
+
+def _attach_dialog_autoaccept(page):
+    # αυτόματο accept για browser-level dialogs (alert/confirm/prompt)
+    try:
+        page.on("dialog", lambda d: (d.accept() if hasattr(d, "accept") else None))
+    except Exception:
+        pass
 
 def _normalize(s: str) -> str:
     s = unicodedata.normalize("NFD", s or "")
@@ -284,44 +288,87 @@ def _set_input_value(page, selector: str, value: str):
         )
         page.wait_for_timeout(60)
 
-# ---- ΝΕΟ: ασφαλές click στο «Αναζήτηση» ---- #
+# ---- ασφαλές click στο «Αναζήτηση» ---- #
 def _click_search(page):
     btn = page.locator(SEL_SEARCH_BTN).first
     try:
         _wait_clickable(page, SEL_SEARCH_BTN, timeout_ms=5_000)
     except Exception:
         pass
-    # 1) Κανονικό click με λίγα retries
     for _ in range(3):
         try:
             btn.click(timeout=2000)
             return True
         except Exception:
-            # πιθανό overlay/busy
             _wait_spinner_cycle_if_any(page)
             page.wait_for_timeout(120)
-
-    # 2) JS click
     try:
         page.evaluate("(sel)=>{const el=document.querySelector(sel); if(el){el.focus(); el.click();}}", SEL_SEARCH_BTN)
         return True
     except Exception:
         pass
-
-    # 3) Enter από το πεδίο Έτος (πολλά ADF έχουν default action)
     try:
         page.locator(SEL_GAK_YEAR).focus()
         page.keyboard.press("Enter")
         return True
     except Exception:
         pass
+    btn.click(timeout=2000, force=True)
+    return True
 
-    # 4) Έσχατο: force click
+# ---- ΝΕΟ: Κλείσιμο του ADF popup «Δεν βρέθηκαν δεδομένα…» ---- #
+def _dismiss_known_overlay(page):
+    """
+    Προσπαθεί να εντοπίσει in-page modal/overlay με μηνύματα τύπου:
+    «Δεν βρέθηκαν δεδομένα…» / «Δεν υπάρχουν αποτελέσματα»
+    και να πατήσει OK (ή ΟΚ). Επιστρέφει True αν πάτησε κάτι.
+    """
+    ok_labels = ["OK", "ΟΚ", "Ok", "ok"]
+    msg_snippets = [
+        "Δεν βρέθηκαν δεδομένα",
+        "Δεν υπάρχουν αποτελέσματα",
+        "Ελέγξτε τα κριτήρια",
+    ]
+    clicked = False
     try:
-        btn.click(timeout=2000, force=True)
-        return True
-    except Exception as e:
-        raise e
+        # 1) Απλά βρες κουμπί OK με role
+        for name in ok_labels:
+            btn = page.get_by_role("button", name=name)
+            if btn.count() and btn.first.is_visible():
+                btn.first.click()
+                page.wait_for_timeout(100)
+                clicked = True
+                break
+        if clicked:
+            return True
+
+        # 2) Εντόπισε κείμενο και πάτα OK με XPath γύρω του
+        for snippet in msg_snippets:
+            loc = page.locator(f"text={snippet}")
+            if loc.count() and loc.first.is_visible():
+                # ψάξε OK κοντά/πάνω στο modal
+                btn = page.locator("//button[normalize-space()='OK' or normalize-space()='ΟΚ']")
+                if btn.count() and btn.first.is_visible():
+                    btn.first.click()
+                    page.wait_for_timeout(100)
+                    return True
+
+        # 3) Fallback: Enter/Escape
+        try:
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(80)
+            return True
+        except Exception:
+            pass
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(80)
+            return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False
 
 # ---------------- Court cache ---------------- #
 def _build_court_map(page):
@@ -342,7 +389,7 @@ def _get_court_value(court_map, label):
             return v
     raise ValueError("Δεν βρέθηκε το ζητούμενο δικαστήριο στη λίστα του SOLON.")
 
-# ---------- Matchers στο ::db ---------- #
+# ---------- Ανάγνωση από πίνακα ---------- #
 def _wait_for_target_row_and_read(page, gak_num: str, gak_year: str, timeout_ms=RESULT_TIMEOUT) -> str:
     js = r"""
     (args) => {
@@ -404,6 +451,7 @@ def _scrape_one(page, court_label: str, gak_num: str, gak_year: str):
     try:
         page.goto(URL, wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle")
+        _attach_dialog_autoaccept(page)
         _accept_cookies_if_present(page)
 
         court_map = _build_court_map(page)
@@ -416,12 +464,17 @@ def _scrape_one(page, court_label: str, gak_num: str, gak_year: str):
 
         prev_sig = _get_db_text(page)
 
-        # >>> ασφαλές click στο «Αναζήτηση»
         _click_search(page)
+
+        # Αν εμφανίστηκε popup «Δεν βρέθηκαν δεδομένα…», κλείστο
+        _dismiss_known_overlay(page)
 
         _wait_for_table_ready(page, timeout_ms=RESULT_TIMEOUT)
         _wait_for_table_change(page, prev_sig, timeout_ms=RESULT_TIMEOUT)
         _wait_spinner_cycle_if_any(page)
+
+        # ξανακλείστο αν τυχόν εμφανιστεί αργότερα
+        _dismiss_known_overlay(page)
 
         result = _wait_for_target_row_and_read(page, gak_num, gak_year, timeout_ms=RESULT_TIMEOUT)
         return {"ok": True, "result": result}
@@ -435,6 +488,7 @@ def _prepare_page_for_batch(context):
     page.set_default_timeout(DEFAULT_TIMEOUT)
     page.goto(URL, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
+    _attach_dialog_autoaccept(page)
     _accept_cookies_if_present(page)
     court_map = _build_court_map(page)
     return page, court_map
@@ -452,12 +506,16 @@ def _search_on_prepared_page(page, court_value: str, gak_num: str, gak_year: str
 
         prev_sig = _get_db_text(page)
 
-        # >>> ασφαλές click στο «Αναζήτηση»
         _click_search(page)
+
+        # Κλείσε τυχόν popup
+        _dismiss_known_overlay(page)
 
         _wait_for_table_ready(page, timeout_ms=RESULT_TIMEOUT)
         _wait_for_table_change(page, prev_sig, timeout_ms=RESULT_TIMEOUT)
         _wait_spinner_cycle_if_any(page)
+
+        _dismiss_known_overlay(page)
 
         result = _wait_for_target_row_and_read(page, gak_num, gak_year, timeout_ms=RESULT_TIMEOUT)
         return {"ok": True, "result": result}
@@ -571,7 +629,7 @@ PAGE_HTML = """
 <html lang="el">
 <head>
 <meta charset="utf-8">
-<title>ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.4</title>
+<title>ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.5</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#f6f7fb;margin:0}
@@ -597,7 +655,7 @@ PAGE_HTML = """
 </head>
 <body>
 <div class="wrap">
-  <h1>ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.4</h1>
+  <h1>ΣΟΛΩΝ Αυτόματες ενημερώσεις — v1.0.5</h1>
 
   <h3>Μονή Αναζήτηση</h3>
   <form id="single">
@@ -761,7 +819,7 @@ def api_batch():
         for i, r in enumerate(rows, start=1):
             in_q.put((i, r))
         for _ in range(BATCH_WORKERS):
-            in_q.put(None)  # sentinels
+            in_q.put(None)
 
         def worker(worker_id: int):
             with sync_playwright() as p:
@@ -793,7 +851,6 @@ def api_batch():
                                     json.dump(res, f, ensure_ascii=False, indent=2)
                                 _dump_dom(page, base)
 
-                            # Email μόνο για ουσιαστικό αποτέλεσμα
                             email_status = None
                             try:
                                 if payload.get("ok") and _is_meaningful_result(payload.get("result")):
